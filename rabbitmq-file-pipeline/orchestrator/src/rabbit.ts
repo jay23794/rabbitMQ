@@ -1,6 +1,6 @@
 import amqp, { Channel, ChannelModel } from "amqplib";
 
-export const QUEUE = "file.uploaded";
+export const QUEUE = "file.uploaded.test";
 
 export interface FileUploadedMessage {
   fileId: string;
