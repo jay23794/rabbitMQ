@@ -1,4 +1,12 @@
-import { FileProcessed, FileUploaded, FileUploadedData, MessageBus, PermanentError } from "@app/messaging";
+import {
+  FileProcessed,
+  FileProgress,
+  FileProgressData,
+  FileUploaded,
+  FileUploadedData,
+  MessageBus,
+  PermanentError,
+} from "@app/messaging";
 import { filesCollection } from "./db";
 
 export async function registerHandlers(bus: MessageBus): Promise<void> {
@@ -10,11 +18,16 @@ export async function registerHandlers(bus: MessageBus): Promise<void> {
     const correlationId = envelope.correlationId;
     console.log(`[consumer] received ${data.fileId} (${data.fileName}) attempt ${attempt}/${maxAttempts}`);
 
+    const progress = (step: FileProgressData["step"], extra: Omit<FileProgressData, "fileId" | "step"> = {}) =>
+      bus.publish(FileProgress, { fileId: data.fileId, step, ...extra }, { correlationId });
+
     try {
       if (data.simulateFailure) {
         throw new PermanentError("simulated");
       }
+      await progress("downloading");
       const size = await downloadAndSave(data);
+      await progress("downloaded", { percent: 100 });
       await bus.publish(FileProcessed, { fileId: data.fileId, status: "success", size }, { correlationId });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);

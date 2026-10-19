@@ -6,6 +6,7 @@
 import { ChannelWrapper } from "amqp-connection-manager";
 import { ConfirmChannel, ConsumeMessage } from "amqplib";
 import { v4 as uuidv4 } from "uuid";
+import { ATTEMPT_HEADER, DEFAULT_MAX_ATTEMPTS, DEFAULT_RETRY_DELAY_MS, DLX_EXCHANGE } from "./config";
 import { createConnection, CreateConnectionOptions } from "./connection";
 import { PermanentError } from "./errors";
 import { Envelope, EventDefinition } from "./event";
@@ -38,11 +39,6 @@ export interface MessageBus {
   close(): Promise<void>;
 }
 
-const DLX_EXCHANGE = "dlx.exchange";
-const ATTEMPT_HEADER = "x-attempt";
-const DEFAULT_MAX_ATTEMPTS = 3;
-const DEFAULT_RETRY_DELAY_MS = 15_000;
-
 export function createMessageBus({ url, serviceName, logger = consoleLogger }: CreateConnectionOptions): MessageBus {
   const connection = createConnection({ url, serviceName, logger });
 
@@ -60,15 +56,19 @@ export function createMessageBus({ url, serviceName, logger = consoleLogger }: C
   
    
   function ensureExchange(exchange: string): Promise<void> {
+    
     let pending = assertedExchanges.get(exchange);
+   
+    
     if (!pending) {
       pending = channel.addSetup(async (ch: ConfirmChannel) => {
         await ch.assertExchange(exchange, "topic", { durable: true });
       });
       // Don't cache a failure; let the next publish try again.
-      pending.catch(() => assertedExchanges.delete(exchange));
+     pending.catch(() => assertedExchanges.delete(exchange));
       assertedExchanges.set(exchange, pending);
     }
+
     return pending;
   }
 

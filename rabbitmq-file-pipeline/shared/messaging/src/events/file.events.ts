@@ -18,6 +18,15 @@ export interface FileProcessedData {
   error?: string; // set when status is "failed"
 }
 
+// Informational step updates while a file is being processed. The final
+// outcome is always FileProcessed; progress may arrive late or out of order.
+export interface FileProgressData {
+  fileId: string;
+  step: "downloading" | "downloaded";
+  percent?: number; // 0-100
+  message?: string; // e.g. "batch 3/20"
+}
+
 export const FileUploaded = defineEvent<FileUploadedData>({
   exchange: "file",
   routingKey: "file.uploaded",
@@ -26,4 +35,9 @@ export const FileUploaded = defineEvent<FileUploadedData>({
 export const FileProcessed = defineEvent<FileProcessedData>({
   exchange: "file",
   routingKey: "file.processed",
+});
+
+export const FileProgress = defineEvent<FileProgressData>({
+  exchange: "file",
+  routingKey: "file.progress",
 });

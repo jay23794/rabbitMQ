@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { randomUUID } from "crypto";
 import express from "express";
-import { createMessageBus, FileProcessed, FileUploaded, FileUploadedData } from "@app/messaging";
+import { createMessageBus, FileProcessed, FileProgress, FileUploaded, FileUploadedData } from "@app/messaging";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const RABBITMQ_URL = process.env.RABBITMQ_URL ?? "amqp://guest:guest@localhost:5672";
@@ -12,6 +12,12 @@ const bus = createMessageBus({ url: RABBITMQ_URL, serviceName: "orchestrator" })
 
 const app = express();
 app.use(express.json());
+
+// Stand-in for object storage until real signed URLs exist: serves a 1 KB
+// dummy file for any id, so /test-publish downloads succeed.
+app.get("/fake-files/:id", (_req, res) => {
+  res.type("application/pdf").send(Buffer.alloc(1024));
+});
 
 // Publishes fake FileUploaded events so the pipeline can be tested end to end
 // before real uploads exist. Query params:
@@ -33,7 +39,7 @@ app.post("/test-publish", async (req, res) => {
       fileId,
       fileName: `sample-${i + 1}.pdf`,
       mimeType: "application/pdf",
-      signedUrl: `https://example.com/fake-signed-url/${fileId}?token=dummy`,
+      signedUrl: `http://localhost:${PORT}/fake-files/${fileId}`,
       uploadedAt: new Date().toISOString(),
       ...(fail && { simulateFailure: true }),
     };
@@ -56,6 +62,12 @@ async function main(): Promise<void> {
   
   // Subscribe before listening so results for jobs published from this
   // process are never missed.
+  // Step updates: log only, never throw (a failed progress log isn't worth a retry).
+  await bus.subscribe(FileProgress, async (data) => {
+    const percent = data.percent !== undefined ? ` ${data.percent}%` : "";
+    console.log(`⏳ ${data.fileId} ${data.step}${percent}${data.message ? ` (${data.message})` : ""}`);
+  });
+
   await bus.subscribe(FileProcessed, async (data) => {
     if (data.status === "success") {
       console.log(`✅ file ${data.fileId} processed (${data.size} bytes)`);
