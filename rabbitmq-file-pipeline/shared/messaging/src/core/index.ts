@@ -3,4 +3,5 @@
 export * from "./logger";
 export * from "./connection";
 export * from "./event";
+export * from "./errors";
 export * from "./bus";

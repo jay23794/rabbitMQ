@@ -1,68 +1,88 @@
-import amqp, { Channel, ChannelModel, ConsumeMessage } from "amqplib";
+import { FileProcessed, FileUploaded, FileUploadedData, MessageBus, PermanentError } from "@app/messaging";
+import { filesCollection } from "./db";
 
-// Must match the orchestrator's queue name and message shape exactly.
-export const QUEUE = "file.uploaded.test";
+export async function registerHandlers(bus: MessageBus): Promise<void> {
+  // Creates/binds file-processor.file.uploaded (+ .retry, .dlq). Throwing from
+  // the handler retries the message (3 tries, 15s apart), then dead-letters it.
+  // Throwing PermanentError skips the retries.
+  await bus.subscribe(FileUploaded, async (data, { envelope, attempt, maxAttempts, isLastAttempt }) => {
+    // Results belong to the same flow as the upload that caused them.
+    const correlationId = envelope.correlationId;
+    console.log(`[consumer] received ${data.fileId} (${data.fileName}) attempt ${attempt}/${maxAttempts}`);
 
-export interface FileUploadedMessage {
-  fileId: string;
-  fileName: string;
-  mimeType: string;
-  signedUrl: string;
-  uploadedAt: string; // ISO 8601 timestamp
+    try {
+      if (data.simulateFailure) {
+        throw new PermanentError("simulated");
+      }
+      const size = await downloadAndSave(data);
+      await bus.publish(FileProcessed, { fileId: data.fileId, status: "success", size }, { correlationId });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      const final = err instanceof PermanentError || isLastAttempt;
+
+      // Report the failure once, when no retry will follow; otherwise the
+      // orchestrator would log ❌ for every attempt.
+      if (final) {
+        await markFailed(data, error);
+        await bus.publish(FileProcessed, { fileId: data.fileId, status: "failed", error }, { correlationId });
+      } else {
+        await markRetrying(data, error);
+      }
+      throw err; // bus decides: retry queue or DLQ
+    }
+  });
 }
 
-let connection: ChannelModel | null = null;
-let channel: Channel | null = null;
+async function downloadAndSave(data: FileUploadedData): Promise<number> {
+  const files = filesCollection();
+  const now = new Date();
 
-export async function startConsumer(url: string): Promise<void> {
-  connection = await amqp.connect(url);
-  channel = await connection.createChannel();
-
-  // Same declaration as the producer. Whichever service starts first creates
-  // the queue; the options must match or RabbitMQ rejects the call.
-  //await channel.assertQueue(QUEUE, { durable: true });
-
-  // prefetch(1) = RabbitMQ sends this consumer at most 1 unacknowledged
-  // message at a time. The next one arrives only after we ack/nack the
-  // current one, so a slow file never piles up work in this process.
-  await channel.prefetch(1);
-
-  connection.on("error", (err) => console.error("[rabbit] connection error:", err));
-  connection.on("close", () => console.warn("[rabbit] connection closed"));
-
-  const ch = channel;
-
-  // noAck: false = manual acknowledgement. RabbitMQ keeps the message
-  // (marked "unacked") until we explicitly ack or nack it. If this process
-  // dies mid-processing, the message goes back to the queue.
-  await ch.consume(
-    QUEUE,
-    (msg: ConsumeMessage | null) => {
-      if (!msg) return; // consumer was cancelled by the broker
-
-      try {
-        const payload = JSON.parse(msg.content.toString()) as FileUploadedMessage;
-        console.log("[consumer] received:", payload);
-
-        // ack = "done, delete it". RabbitMQ removes the message from the queue.
-        ch.ack(msg);
-      } catch (err) {
-        console.error("[consumer] failed to process message:", err);
-
-        // nack(msg, allUpTo=false, requeue=false) = reject this one message
-        // and DON'T put it back. Otherwise a bad message (e.g. invalid JSON)
-        // would be redelivered forever. With no dead-letter exchange set up,
-        // it is discarded.
-        ch.nack(msg, false, false);
-      }
+  // Upsert keyed on fileId, so a redelivered message updates the same record
+  // instead of creating a duplicate.
+  await files.updateOne(
+    { _id: data.fileId },
+    {
+      $set: { fileName: data.fileName, mimeType: data.mimeType, status: "processing", updatedAt: now },
+      $setOnInsert: { createdAt: now },
     },
-    { noAck: false },
+    { upsert: true },
   );
 
-  console.log(`[consumer] waiting for messages on "${QUEUE}"`);
+  const res = await fetch(data.signedUrl);
+  if (!res.ok) {
+    // 4xx (missing file, expired/invalid signed URL) won't fix itself;
+    // 5xx may be a temporary storage outage, so let it retry.
+    const message = `download failed: HTTP ${res.status}`;
+    throw res.status >= 400 && res.status < 500 ? new PermanentError(message) : new Error(message);
+  }
+  // Buffers the whole file in memory; fine for now, switch to streaming to
+  // disk for the 100 MB limit (plan.md Phase 4).
+  const sizeBytes = (await res.arrayBuffer()).byteLength;
+
+  await files.updateOne(
+    { _id: data.fileId },
+    { $set: { sizeBytes, status: "downloaded", updatedAt: new Date() }, $unset: { error: "" } },
+  );
+
+  console.log(`[consumer] saved ${data.fileId} (${sizeBytes} bytes)`);
+  return sizeBytes;
 }
 
-export async function stopConsumer(): Promise<void> {
-  await channel?.close();
-  await connection?.close();
+async function markFailed(data: FileUploadedData, error: string): Promise<void> {
+  const now = new Date();
+  await filesCollection().updateOne(
+    { _id: data.fileId },
+    {
+      $set: { fileName: data.fileName, mimeType: data.mimeType, status: "failed", error, updatedAt: now },
+      $setOnInsert: { createdAt: now },
+    },
+    { upsert: true },
+  );
+}
+
+async function markRetrying(data: FileUploadedData, error: string): Promise<void> {
+  await filesCollection().updateOne(
+    { _id: data.fileId },
+    { $set: { status: "retrying", error, updatedAt: new Date() } },
+  );
 }
