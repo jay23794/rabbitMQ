@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "amqplib": "^2.2.0",
+    "@app/messaging": "file:../shared/messaging",
     "dotenv": "^18.0.8",
     "express": "^5.3.0"
   },

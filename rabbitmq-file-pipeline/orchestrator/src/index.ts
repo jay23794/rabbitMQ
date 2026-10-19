@@ -1,40 +1,35 @@
 import "dotenv/config";
 import { randomUUID } from "crypto";
 import express from "express";
-import { closeRabbit, connectRabbit, FileUploadedMessage, publishFileUploaded } from "./rabbit";
-import { EXCHANGE, ROUTING_KEY } from "./topology";
+import { createMessageBus, FileProcessed, FileUploaded, FileUploadedData } from "@app/messaging";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const RABBITMQ_URL = process.env.RABBITMQ_URL ?? "amqp://guest:guest@localhost:5672";
 
+// One bus per process: owns the connection, reconnects on its own and
+// re-declares exchanges/queues after a reconnect.
+const bus = createMessageBus({ url: RABBITMQ_URL, serviceName: "orchestrator" });
+
 const app = express();
 app.use(express.json());
 
-// Publishes fake FileUploadedMessages so the pipeline can be tested end to end
+// Publishes fake FileUploaded events so the pipeline can be tested end to end
 // before real uploads exist. Query params:
-//   ?fail=true  -> simulateFailure: true (consumer nacks -> DLQ)
-//   ?ttl=5000   -> per-message TTL in ms (expires -> DLQ if not consumed)
-//   ?count=15   -> publish N messages (queue max-length is 10 -> oldest go to DLQ)
-app.post("/test-publish", (req, res) => {
-  console.log("********");
-
+//   ?fail=true  -> simulateFailure: true (consumer throws -> DLQ)
+//   ?count=15   -> publish N messages
+app.post("/test-publish", async (req, res) => {
   const fail = req.query.fail === "true";
-  const ttlMs = req.query.ttl !== undefined ? Number(req.query.ttl) : undefined;
   const count = req.query.count !== undefined ? Number(req.query.count) : 1;
 
-  if (ttlMs !== undefined && (!Number.isInteger(ttlMs) || ttlMs < 0)) {
-    res.status(400).json({ error: "ttl must be a non-negative integer (ms)" });
-    return;
-  }
   if (!Number.isInteger(count) || count < 1 || count > 1000) {
     res.status(400).json({ error: "count must be an integer between 1 and 1000" });
     return;
   }
 
-  const messages: FileUploadedMessage[] = [];
+  const messages: FileUploadedData[] = [];
   for (let i = 0; i < count; i++) {
     const fileId = randomUUID();
-    const msg: FileUploadedMessage = {
+    const data: FileUploadedData = {
       fileId,
       fileName: `sample-${i + 1}.pdf`,
       mimeType: "application/pdf",
@@ -42,24 +37,32 @@ app.post("/test-publish", (req, res) => {
       uploadedAt: new Date().toISOString(),
       ...(fail && { simulateFailure: true }),
     };
-    publishFileUploaded(msg, { ttlMs });
-    messages.push(msg);
+    // Resolves once the broker has confirmed it stored the message.
+    await bus.publish(FileUploaded, data);
+    messages.push(data);
   }
 
   // 202 Accepted: the jobs are queued, not processed yet.
   res.status(202).json({
     queued: messages.length,
-    exchange: EXCHANGE,
-    routingKey: ROUTING_KEY,
-    ttlMs: ttlMs ?? null,
+    exchange: `${FileUploaded.exchange}.exchange`,
+    routingKey: FileUploaded.routingKey,
     messages,
   });
 });
 
 async function main(): Promise<void> {
-  // Connect to RabbitMQ first so the HTTP server never accepts requests
-  // it can't publish.
-  await connectRabbit(RABBITMQ_URL);
+  console.log("MAIN");
+  
+  // Subscribe before listening so results for jobs published from this
+  // process are never missed.
+  await bus.subscribe(FileProcessed, async (data) => {
+    if (data.status === "success") {
+      console.log(`✅ file ${data.fileId} processed (${data.size} bytes)`);
+    } else {
+      console.log(`❌ ${data.fileId} failed: ${data.error}`);
+    }
+  });
 
   const server = app.listen(PORT, () => {
     console.log(`[orchestrator] listening on http://localhost:${PORT}`);
@@ -67,7 +70,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     server.close();
-    await closeRabbit();
+    await bus.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
